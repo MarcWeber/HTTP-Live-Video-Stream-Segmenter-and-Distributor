@@ -1,0 +1,3 @@
+- add sample config using multiple transfers
+- verify that none of the Transfer implementations is closing the io handle
+  which gets rewinded (Exceptions will tell ..)

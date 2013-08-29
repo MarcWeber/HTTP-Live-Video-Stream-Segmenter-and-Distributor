@@ -20,13 +20,128 @@ require 'rubygems'
 
 require 'fileutils'
 
+require 'stringio'
+
+module Transfer
+  # note: I'm not sure whether its worth thinking about keeping a FTP/S3 like
+  # connection open. There might be timeouts, there might be failures.
+  # Reconnecting ensures operation continues if such a failure happens.
+  # Otherwise more problems have to be caught and handled
+
+  module Can
+
+    def require
+      Array[self::REQUIRES].each {|v| require v}
+    end
+
+    def can
+      require
+      return true
+    rescue LoadError
+      return false
+    end
+  end
+
+  module SetInstanceVars
+    def set_instance_vars(config, *args)
+      args.each {|v| self.instance_variable_set(v, config..fetch(v)) }
+    end
+  end
+
+  class SCP
+    extend TransferBase
+    include SetInstanceVars
+    RERQUIRES = 'net/scp'
+
+    def initialize(config)
+      set_instance_vars(config, 'config', 'user_name','directory')
+      # optional:
+      @password = config['password']
+    end
+
+    def withConnection(&blk)
+      if @password
+        Net::SCP.start!(@remote_host, @user_name, :password => password, &blk)
+      else
+        Net::SCP.start!(@remote_host, @user_name, &blk)
+      end
+    end
+
+    def create_file(destination_file, io)
+      withConnection do |scp|
+        scp.upload! io, @directory + destination_file
+      end
+    end
+  end
+
+  class Copy
+    extend TransferBase
+    include SetInstanceVars
+    RERQUIRES = []
+
+    def initialize(config)
+      set_instance_vars(config, 'directory')
+    end
+
+    def create_file(destination_file, io)
+      File.open(@directory + destination_file, "wb") { |file| file.write(io) }
+    end
+  end
+
+  class S3
+    RERQUIRES = 'right_aws'
+    extend TransferBase
+    include SetInstanceVars
+
+    def initialize(config)
+      set_instance_vars(config, 'aws_api_key','aws_api_secret','bucket_name','key_prefix')
+      @s3 = RightAws::S3Interface.new(@aws_api_key, @aws_api_secret)
+    end
+
+    def create_file(destination_file, io)
+      content_type = source_file =~ /.*\.m3u8$/ ? 'application/vnd.apple.mpegurl' : 'video/MP2T'
+      @log.debug("Content type: #{content_type}")
+      @s3.put(@bucket_name, "#{@key_prefix}/#{destination_file}", io, {'x-amz-acl' => 'public-read', 'content-type' => content_type})
+    end
+  end
+
+  class CF
+    extend TransferBase
+    include SetInstanceVars
+    RERQUIRES = 'cloudfiles'
+
+    def initialize(config)
+      set_instance_vars(config, 'username', 'api_key', 'container', 'key_prefix')
+    end
+
+    def create_file(destination_file, io)
+      cf = CloudFiles::Connection.new(:username => @username, :api_key => @api_key)
+      container = cf.container(@container)
+      object = container.create_object "#{@key_prefix}/#{destination_file}", false
+      object.write io
+    end
+  end
+end
+
 class HSTransfer
 
   QUIT='quit'
   MULTIRATE_INDEX='mr_index'
+  DELETE_OLD='delete_old' # TODO: delete old segments on restart, implement this, call this before starting first transfer
+
+  # this implementation may change, eg create classes instead?
+  TRANSFER_TYPES = {
+    'scp' => Transfer::SCP,
+    'ftp' => Transfer::FTP,
+    's3' => Transfer::S3,
+    'cf' => Transfer::CF
+  }
 
   def self.init_and_start_transfer_thread(log, config)
-    hstransfer = HSTransfer.new(log, config)
+    transfer_config = @config[@config['transfer_profile']]
+    profiles = Array[*transfer_config]
+    transfers = profiles.map { |profile| TRANSFER_TYPES[profile['transfer_type']].new(profile) }
+    hstransfer = HSTransfer.new(log, config, transfers)
     hstransfer.start_transfer_thread
     return hstransfer
   end
@@ -40,7 +155,8 @@ class HSTransfer
     @transfer_thread.join
   end
 
-  def initialize(log, config)
+  def initialize(log, config, transfer)
+    @transfer = transfre
     @transfer_queue = Queue.new
     @log = log
     @config = config
@@ -48,69 +164,47 @@ class HSTransfer
 
   def start_transfer_thread
     @transfer_thread = Thread.new do
+      # why not log which transfer is initiated?
       @log.info('Transfer thread started');
       while (value = @transfer_queue.pop)
-        @log.info("Transfer initiated with value = *#{value}*");
+        begin
+          @log.info("Transfer initiated with value = *#{value}*");
 
-        if value == QUIT
-          break
-        elsif value == MULTIRATE_INDEX
-          create_and_transfer_multirate_index
-        else
-          begin
+          if value == QUIT
+            break
+          elsif value == MULTIRATE_INDEX
+            create_and_transfer_multirate_index
+          else
             create_index_and_run_transfer(value)
-          rescue
-            @log.error("Error running transfer: " + $!)
           end
-        end
 
-        @log.info('Transfer done');
+          @log.info('Transfer done');
+        rescue
+          @log.error("Error running transfer: " + $!.inspect)
+        end
       end
       @log.info('Transfer thread terminated');
     end
   end
 
-  def self.can_scp
-    begin
-      require 'net/scp'
-      return true
-    rescue LoadError
-      return false
-    end
+  # returns whether this transfer_type is available
+  def self.can(transfer_type)
+    TRANSFER_TYPES.fetch(transfer_type).can
   end
 
-  def self.can_ftp
-    begin
-      require 'net/ftp'
-      return true
-    rescue LoadError
-      return false
-    end
-  end
-
-  def self.can_s3
-    begin
-      require 'right_aws'
-      return true
-    rescue LoadError
-      return false
-    end
-  end
-  
-  def self.can_cf
-    begin
-      require 'cloudfiles'
-      return true
-    rescue LoadError
-      return false
-    end
-  end
+  # use method_missing or such instead? for backward compatibility
+  def self.can_scp; self.can('scp'); end
+  def self.can_ftp; self.can('ftp'); end
+  def self.can_s3; self.can('s3'); end
+  def self.can_cf; self.can('cf'); end
 
   private
 
   def create_and_transfer_multirate_index
+    # the multirate_index references the individual index files
+
     @log.debug('Creating multirate index')
-    File.open("tmp.index.multi.m3u8", 'w') do |index_file|
+    StringIO.new do |index_file|
       index_file.write("#EXTM3U\n")
 
       @config['encoding_profile'].each do |encoding_profile_name|
@@ -119,89 +213,53 @@ class HSTransfer
         index_name = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile_name]
         index_file.write("#{@config['url_prefix']}#{index_name}\n")
       end
-    end
 
-    @log.debug('Transfering multirate index')
-    transfer_file("tmp.index.multi.m3u8", "#{@config["index_prefix"]}_multi.m3u8")
+      @log.debug('Transfering multirate index')
+      create_file("#{@config["index_prefix"]}_multi.m3u8", index_file)
+    end
   end
 
-  def create_index(index_segment_count, segment_duration, output_prefix, encoding_profile, http_prefix, first_segment, last_segment, stream_end)
+  def create_index(io, index_segment_count, segment_duration, output_prefix, encoding_profile, http_prefix, first_segment, last_segment, stream_end)
     @log.debug('Creating index');
 
-    File.open("tmp.index.#{encoding_profile}.m3u8", 'w') do |index_file|
-      index_file.write("#EXTM3U\n")
-      index_file.write("#EXT-X-TARGETDURATION:#{segment_duration}\n")
-      index_file.write("#EXT-X-MEDIA-SEQUENCE:#{last_segment >= index_segment_count ? last_segment-(index_segment_count-1) : 1}\n")
+    io.write("#EXTM3U\n")
+    io.write("#EXT-X-TARGETDURATION:#{segment_duration}\n")
+    io.write("#EXT-X-MEDIA-SEQUENCE:#{last_segment >= index_segment_count ? last_segment-(index_segment_count-1) : 1}\n")
 
-      first_segment.upto(last_segment) do | segment_index |
-        if segment_index > last_segment - index_segment_count
-          index_file.write("#EXTINF:#{segment_duration},\n")
-          index_file.write("#{http_prefix}#{output_prefix}_#{encoding_profile}-%05u.ts\n" % segment_index)
-        end
+    first_segment.upto(last_segment) do | segment_index |
+      if segment_index > last_segment - index_segment_count
+        io.write("#EXTINF:#{segment_duration},\n")
+        io.write("#{http_prefix}#{output_prefix}_#{encoding_profile}-%05u.ts\n" % segment_index)
       end
-
-      index_file.write("#EXT-X-ENDLIST\n") if stream_end
     end
+
+    io.write("#EXT-X-ENDLIST\n") if stream_end
 
     @log.debug('Done creating index');
   end
 
   def create_index_and_run_transfer(value)
     (first_segment, last_segment, stream_end, encoding_profile) = value.strip.split(%r{,\s*})
-    create_index(@config['index_segment_count'], @config['segment_length'], @config['segment_prefix'], encoding_profile, @config['url_prefix'], first_segment.to_i, last_segment.to_i, stream_end.to_i == 1)
 
     # Transfer the index
-    final_index = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile]
-    transfer_file("tmp.index.#{encoding_profile}.m3u8", "#{final_index}")
+    destination_file = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile]
+    StringIO.new do |index_file|
+      create_index(index_file, @config['index_segment_count'], @config['segment_length'], @config['segment_prefix'], encoding_profile, @config['url_prefix'], first_segment.to_i, last_segment.to_i, stream_end.to_i == 1)
+      create_file(destination_file, index_file)
+    end
 
     # Transfer the video stream
     video_filename = "#{@config['temp_dir']}/#{@config['segment_prefix']}_#{encoding_profile}-%05u.ts" % last_segment.to_i
     dest_video_filename = "#{@config['segment_prefix']}_#{encoding_profile}-%05u.ts" % last_segment.to_i
-    transfer_file(video_filename, dest_video_filename)
+    File.open(video_filename, "rb") do |file|
+      create_file(file, dest_video_filename)
+    end
   end
 
-  def transfer_file(source_file, destination_file)
-     transfer_config = @config[@config['transfer_profile']]
-
-     case transfer_config['transfer_type']
-       when 'copy'
-         FileUtils.copy(source_file, transfer_config['directory'] + '/' + destination_file)
-       when 'ftp'
-         require 'net/ftp'
-         Net::FTP.open(transfer_config['remote_host']) do |ftp|
-           ftp.login(transfer_config['user_name'], transfer_config['password'])
-           files = ftp.chdir(transfer_config['directory'])
-           ftp.putbinaryfile(source_file, destination_file)
-         end
-       when 'scp'
-         require 'net/scp'
-         if transfer_config.has_key?('password')
-           Net::SCP.upload!(transfer_config['remote_host'], transfer_config['user_name'], source_file, transfer_config['directory'] + '/' + destination_file, :password => transfer_config['password'])
-         else
-           Net::SCP.upload!(transfer_config['remote_host'], transfer_config['user_name'], source_file, transfer_config['directory'] + '/' + destination_file)
-         end
-       when 's3'
-         require 'right_aws'
-         s3 = RightAws::S3Interface.new(transfer_config['aws_api_key'], transfer_config['aws_api_secret'])
-
-         content_type = source_file =~ /.*\.m3u8$/ ? 'application/vnd.apple.mpegurl' : 'video/MP2T'
-
-         @log.debug("Content type: #{content_type}")
-
-         s3.put(transfer_config['bucket_name'], "#{transfer_config['key_prefix']}/#{destination_file}", File.open(source_file), {'x-amz-acl' => 'public-read', 'content-type' => content_type})
-    	when 'cf'
-         require 'cloudfiles'
-         cf = CloudFiles::Connection.new(:username => transfer_config['username'], :api_key => transfer_config['api_key'])
-  
-         container = cf.container(transfer_config['container'])
-         
-         object = container.create_object "#{transfer_config['key_prefix']}/#{destination_file}", false
-         object.write File.open(source_file)
-       else
-         @log.error("Unknown transfer type: #{transfer_config['transfer_type']}")
-     end
-
-     File.unlink(source_file)
+  def create_file(destination_file, io_rewindable)
+    @transfers.each do |t|
+      io_rewindable.rewind
+      t.create_file(destination_file, io_rewindable)
+    end
   end
-
 end
