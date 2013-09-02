@@ -74,11 +74,6 @@ class HSConfig
       raise 
     end
 
-    if !File.readable? config['input_location']
-      log.error("The input file can not be read: #{config['input_location']}")
-      raise 
-    end
-
     if config['segment_length'] < 3
       log.error("Segment length can not be less than 3 seconds: #{config['segment_length']}")
       raise 
@@ -98,36 +93,23 @@ class HSConfig
       end
     end
 
-    if config[config['transfer_profile']].nil?
-      log.error("The given transfer profile was not found in the config: #{config['transfer_profile']}")
-      raise 
-    end
+    tp_profiles = Array[*config['transfer_profile']]
+    tp_profiles.each do |tp_name|
+      tp_profile = config[tp_name]
+      if tp_profile.nil?
+	log.error("The given transfer profile was not found in the config: #{config['transfer_profile']}")
+	raise 
+      end
 
-    if config[config['transfer_profile']]['transfer_type'] != 'ftp' and config[config['transfer_profile']]['transfer_type'] != 'scp' and
-       config[config['transfer_profile']]['transfer_type'] != 's3' and config[config['transfer_profile']]['transfer_type'] != 'copy' and
-       config[config['transfer_profile']]['transfer_type'] != 'cf' 
-      log.error("The given transfer type is not known: #{config[config['transfer_profile']]['transfer_type']}")
-      raise 
-    end
+      transfer_type = tp_profile['transfer_type']
+      if !HSTransfer::known(transfer_type)
+	log.error("The given transfer type is not known: #{transfer_type}")
+      end
 
-    if !HSTransfer::can_ftp and config[config['transfer_profile']]['transfer_type'] == 'ftp'
-      log.error("The given transfer type is not available: #{config[config['transfer_profile']]['transfer_type']}")
-      raise 
-    end
-
-    if !HSTransfer::can_scp and config[config['transfer_profile']]['transfer_type'] == 'scp'
-      log.error("The given transfer type is not available: #{config[config['transfer_profile']]['transfer_type']}")
-      raise 
-    end
-
-    if !HSTransfer::can_s3 and config[config['transfer_profile']]['transfer_type'] == 's3'
-      log.error("The given transfer type is not available: #{config[config['transfer_profile']]['transfer_type']}")
-      raise 
-    end
-    
-    if !HSTransfer::can_cf and config[config['transfer_profile']]['transfer_type'] == 'cf'
-      log.error("The given transfer type is not available: #{config[config['transfer_profile']]['transfer_type']}")
-      raise 
+      if !HSTransfer::can(transfer_type)
+	log.error("The given transfer type is not available: #{transfer_type}")
+	raise 
+      end
     end
 
   end

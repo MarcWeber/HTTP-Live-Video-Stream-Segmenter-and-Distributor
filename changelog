@@ -1,0 +1,25 @@
+hs_transfer:
+  - refactor: each tranfer type one class, this way is more extensible
+  - allow multiple tranfser profiles given at the same time
+  - don't create temporary files on disk unless necessary. Eg use StringIO and
+    implement create_file replacing transfer_file
+    TODO: check that none of the Transfer::* implementations close the file
+    handle when they are done, because hs_transfer is using rewind
+- delete .ts files in the tmp directory after transferring
+- delete current-N'th segment from server to avoid filling it up
+  delete_nth_segment_back setting like index_segment_count
+- url_prefix,
+  url_prefix_m3u  (defaulting to url_prefix)
+  is now configured in the copy profile configuration
+  Each copy location has its own index file with custom url_prefix now
+- first copy segment, then index!
+- add 
+  cf_aws_api_key
+  cf_aws_api_secret
+  cf_distribution_id
+  .m3u8 files
+
+- info: While there is the S3 bucket target it might be better to copy the
+files to a HTTP server and use amazon cloudfront to read from it.
+At least I was not able to configure the TTL for .m3u8 files so that they get
+updated ..

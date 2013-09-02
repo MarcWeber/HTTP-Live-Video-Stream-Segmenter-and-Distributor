@@ -30,12 +30,12 @@ module Transfer
 
   module Can
 
-    def require
-      Array[self::REQUIRES].each {|v| require v}
+    def require_modules
+      Array[*self::REQUIRES].each {|v| require v}
     end
 
     def can
-      require
+      require_modules
       return true
     rescue LoadError
       return false
@@ -43,25 +43,30 @@ module Transfer
   end
 
   module SetInstanceVars
+    attr_reader :url_prefix, :url_prefix_m3u
     def set_instance_vars(config, *args)
-      args.each {|v| self.instance_variable_set(v, config..fetch(v)) }
+      args.each {|v| self.instance_variable_set("@#{v}", config[v]) }
+      @url_prefix = config['url_prefix']
+      @url_prefix_m3u = config['url_prefix_m3u'] || @url_prefix
     end
   end
 
   class SCP
-    extend TransferBase
+    extend Can
     include SetInstanceVars
-    RERQUIRES = 'net/scp'
+    REQUIRES = 'net/scp'
 
-    def initialize(config)
-      set_instance_vars(config, 'config', 'user_name','directory')
+    def initialize(log, config)
+      @log = log
+      self.class.require_modules
+      set_instance_vars(config, 'config', 'remote_host', 'user_name', 'directory')
       # optional:
       @password = config['password']
     end
 
     def withConnection(&blk)
       if @password
-        Net::SCP.start!(@remote_host, @user_name, :password => password, &blk)
+        Net::SCP.start!(@remote_host, @user_name, :password => @password, &blk)
       else
         Net::SCP.start!(@remote_host, @user_name, &blk)
       end
@@ -72,45 +77,88 @@ module Transfer
         scp.upload! io, @directory + destination_file
       end
     end
+
+    def try_delete_file(name)
+      puts "TODO: delete @directory + destination_file"
+    end
   end
 
   class Copy
-    extend TransferBase
+    extend Can
     include SetInstanceVars
-    RERQUIRES = []
+    REQUIRES = []
 
-    def initialize(config)
+    def initialize(log, config)
+      @log = log
+      self.class.require_modules
       set_instance_vars(config, 'directory')
     end
 
     def create_file(destination_file, io)
-      File.open(@directory + destination_file, "wb") { |file| file.write(io) }
+      require 'fileutils'
+      file = @directory + destination_file
+      FileUtils.mkdir_p File.dirname(file)
+      File.open(file, "wb") { |file| file.write(io.read) }
+    end
+
+    def try_delete_file(name)
+      n = @directory + name
+      puts "trying to delete #{n}"
+      File.delete(n) if File.exist? n
     end
   end
 
   class S3
-    RERQUIRES = 'right_aws'
-    extend TransferBase
+    REQUIRES = 'right_aws'
+    extend Can
     include SetInstanceVars
 
-    def initialize(config)
+    def initialize(log, config)
+      @log = log
+      self.class.require_modules
       set_instance_vars(config, 'aws_api_key','aws_api_secret','bucket_name','key_prefix')
       @s3 = RightAws::S3Interface.new(@aws_api_key, @aws_api_secret)
+
+
+      if (config['cf_distribution_id'])
+	@cf =   RightAws::AcfInterface.new(config['cf_aws_api_key'],config['cf_aws_api_secret'])
+	@cf_distribution_id = config['cf_distribution_id']
+      end
     end
 
     def create_file(destination_file, io)
-      content_type = source_file =~ /.*\.m3u8$/ ? 'application/vnd.apple.mpegurl' : 'video/MP2T'
-      @log.debug("Content type: #{content_type}")
-      @s3.put(@bucket_name, "#{@key_prefix}/#{destination_file}", io, {'x-amz-acl' => 'public-read', 'content-type' => content_type})
+      begin
+	content_type = destination_file =~ /.*\.m3u8$/ ? 'application/vnd.apple.mpegurl' : 'video/MP2T'
+	@s3.put(@bucket_name, "#{@key_prefix}#{destination_file}", io, {'x-amz-acl' => 'public-read', 'content-type' => content_type})
+      rescue Exception => e
+	@log.debug("error for #{destination_file}")
+	puts e.message
+	puts e.backtrace
+      end
+    end
+
+    def invalidate(name)
+      @cf.create_invalidation(@cf_distribution_id, :path => [ "/#{@key_prefix}#{name}"]) if @cf
+    end
+
+    def try_delete_file(name)
+      begin
+	n = "#{@key_prefix}/#{name}"
+	@s3.delete(@bucket_name, n)
+      rescue
+	@log.debug( "s3: error deleting #{n}")
+      end
     end
   end
 
   class CF
-    extend TransferBase
+    extend Can
     include SetInstanceVars
-    RERQUIRES = 'cloudfiles'
+    REQUIRES = 'cloudfiles'
 
-    def initialize(config)
+    def initialize(log, config)
+      @log = log
+      self.class.require_modules
       set_instance_vars(config, 'username', 'api_key', 'container', 'key_prefix')
     end
 
@@ -119,6 +167,32 @@ module Transfer
       container = cf.container(@container)
       object = container.create_object "#{@key_prefix}/#{destination_file}", false
       object.write io
+    end
+  end
+
+  class FTP
+    extend Can
+    include SetInstanceVars
+    REQUIRES = 'net/ftp'
+
+    def initialize(log, config)
+      @log = log
+      self.class.require_modules
+      set_instance_vars(config, 'remote_host', 'user_name', 'password', 'directory')
+    end
+
+    def create_file(destination_file, io)
+      Net::FTP.open(@remote_host) do |ftp|
+	ftp.login(@user_name, @password)
+	files = ftp.chdir(@directory)
+	# writing a file multiple times when connecting to many ftp servers
+	# might not be too efficient, I don't expect you to do that ..
+	Tempfile.open('ftp-tmp') do |f|
+	  f.write(io.read)
+	  f.close
+	  tp.putbinaryfile(f.path, destination_file)
+	end
+      end
     end
   end
 end
@@ -134,13 +208,16 @@ class HSTransfer
     'scp' => Transfer::SCP,
     'ftp' => Transfer::FTP,
     's3' => Transfer::S3,
-    'cf' => Transfer::CF
+    'cf' => Transfer::CF,
+    'copy' => Transfer::Copy
   }
 
   def self.init_and_start_transfer_thread(log, config)
-    transfer_config = @config[@config['transfer_profile']]
-    profiles = Array[*transfer_config]
-    transfers = profiles.map { |profile| TRANSFER_TYPES[profile['transfer_type']].new(profile) }
+    profiles_names = Array[*config['transfer_profile']]
+    transfers = profiles_names.map do |profile_name|
+      profile = config[profile_name]
+      TRANSFER_TYPES[profile['transfer_type']].new(log, profile)
+    end
     hstransfer = HSTransfer.new(log, config, transfers)
     hstransfer.start_transfer_thread
     return hstransfer
@@ -155,8 +232,8 @@ class HSTransfer
     @transfer_thread.join
   end
 
-  def initialize(log, config, transfer)
-    @transfer = transfre
+  def initialize(log, config, transfers)
+    @transfers = transfers
     @transfer_queue = Queue.new
     @log = log
     @config = config
@@ -179,7 +256,9 @@ class HSTransfer
           end
 
           @log.info('Transfer done');
-        rescue
+	rescue Exception => e
+          puts e.message
+          puts e.backtrace
           @log.error("Error running transfer: " + $!.inspect)
         end
       end
@@ -190,6 +269,10 @@ class HSTransfer
   # returns whether this transfer_type is available
   def self.can(transfer_type)
     TRANSFER_TYPES.fetch(transfer_type).can
+  end
+
+  def self.known(transfer_type)
+    TRANSFER_TYPES.include? transfer_type
   end
 
   # use method_missing or such instead? for backward compatibility
@@ -203,19 +286,22 @@ class HSTransfer
   def create_and_transfer_multirate_index
     # the multirate_index references the individual index files
 
-    @log.debug('Creating multirate index')
-    StringIO.new do |index_file|
-      index_file.write("#EXTM3U\n")
+    @transfers.each do |transfer|
 
-      @config['encoding_profile'].each do |encoding_profile_name|
-        encoding_profile = @config[encoding_profile_name]
-        index_file.write("#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=#{encoding_profile['bandwidth']}\n")
-        index_name = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile_name]
-        index_file.write("#{@config['url_prefix']}#{index_name}\n")
+      @log.debug('Creating multirate index')
+      StringIO.open do |index_file|
+	index_file.write("#EXTM3U\n")
+
+	@config['encoding_profile'].each do |encoding_profile_name|
+	  encoding_profile = @config[encoding_profile_name]
+	  index_file.write("#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=#{encoding_profile['bandwidth']}\n")
+	  index_name = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile_name]
+	  index_file.write("#{transfer.url_prefix_m3u}#{index_name}\n")
+	end
+
+	@log.debug('Transfering multirate index')
+	transfer.create_file("#{@config["index_prefix"]}_multi.m3u8", index_file)
       end
-
-      @log.debug('Transfering multirate index')
-      create_file("#{@config["index_prefix"]}_multi.m3u8", index_file)
     end
   end
 
@@ -241,22 +327,45 @@ class HSTransfer
   def create_index_and_run_transfer(value)
     (first_segment, last_segment, stream_end, encoding_profile) = value.strip.split(%r{,\s*})
 
-    # Transfer the index
-    destination_file = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile]
-    StringIO.new do |index_file|
-      create_index(index_file, @config['index_segment_count'], @config['segment_length'], @config['segment_prefix'], encoding_profile, @config['url_prefix'], first_segment.to_i, last_segment.to_i, stream_end.to_i == 1)
-      create_file(destination_file, index_file)
-    end
-
     # Transfer the video stream
     video_filename = "#{@config['temp_dir']}/#{@config['segment_prefix']}_#{encoding_profile}-%05u.ts" % last_segment.to_i
     dest_video_filename = "#{@config['segment_prefix']}_#{encoding_profile}-%05u.ts" % last_segment.to_i
     File.open(video_filename, "rb") do |file|
-      create_file(file, dest_video_filename)
+      create_file(dest_video_filename, file)
+    end
+    # don't fill up the tmp directory
+    File.delete video_filename
+
+    @transfers.each do |transfer|
+      # Transfer the index
+      destination_file = "%s_%s.m3u8" % [@config['index_prefix'], encoding_profile]
+      StringIO.open do |index_file|
+	create_index(index_file, @config['index_segment_count'], @config['segment_length'], @config['segment_prefix'], encoding_profile, transfer.url_prefix, first_segment.to_i, last_segment.to_i, stream_end.to_i == 1)
+	@log.info("transferring #{destination_file}")
+	index_file.rewind
+	transfer.create_file(destination_file, index_file)
+	if transfer.respond_to? :invalidate
+	  @log.info("invalidating #{destination_file}")
+	  transfer.invalidate(destination_file) 
+	end
+      end
+    end
+
+    if (@config['delete_nth_segment_back'])
+      name = "#{@config['segment_prefix']}_#{encoding_profile}-%05u.ts" % (last_segment.to_i - @config['delete_nth_segment_back'].to_i)
+      try_delete_file(name)
+    end
+  end
+
+  def try_delete_file(name)
+    @log.info("trying to delete #{name}")
+    @transfers.each do |t|
+      t.try_delete_file(name)
     end
   end
 
   def create_file(destination_file, io_rewindable)
+    @log.info("transferring #{destination_file}")
     @transfers.each do |t|
       io_rewindable.rewind
       t.create_file(destination_file, io_rewindable)

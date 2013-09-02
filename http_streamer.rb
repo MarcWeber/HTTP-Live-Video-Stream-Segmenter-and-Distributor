@@ -37,11 +37,7 @@ if ARGV.length != 1
   exit 1
 end
 
-begin
-  config = HSConfig::load( ARGV[0] )
-rescue
-  exit 1
-end
+config = HSConfig::load( ARGV[0] )
 
 log = HSConfig::log_setup( config )
 
